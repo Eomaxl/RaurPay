@@ -3,10 +3,10 @@ module github.com/Eomaxl/RaurPay
 go 1.21
 
 require (
-    github.com/go-redis/redis/v8 v8.11.5
-    github.com/gocql/gocql v1.6.0
-    github.com/kelseyhightower/envconfig v1.4.0
-    github.com/shopspring/decimal v1.3.1
+	github.com/go-redis/redis/v8 v8.11.5
+	github.com/gocql/gocql v1.6.0
+	github.com/kelseyhightower/envconfig v1.4.0
+	github.com/shopspring/decimal v1.3.1
 )
 
 require (
