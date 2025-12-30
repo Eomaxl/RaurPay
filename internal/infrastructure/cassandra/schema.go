@@ -8,12 +8,12 @@ import (
 )
 
 // SchemaManager handles Cassandra schema creation and migration
-type SchemaManager struct{
+type SchemaManager struct {
 	session *gocql.Session
 }
 
 // NewSchemaManager creates a new schema manager instance
-func NewSchemaManager(session *gocql.Session) *SchemaManager{
+func NewSchemaManager(session *gocql.Session) *SchemaManager {
 	return &SchemaManager{
 		session: session,
 	}
@@ -107,7 +107,7 @@ func (sm *SchemaManager) createAccountBalancesTable() string {
 		 }`
 }
 
-//createOutboxEventsTable creates the outbox events table for transactional consistency
+// createOutboxEventsTable creates the outbox events table for transactional consistency
 func (sm *SchemaManager) createOutboxEventsTable() string {
 	return `
 		CREATE TABLE IF NOT EXISTS outbox_events (
@@ -149,7 +149,6 @@ func (sm *SchemaManager) createIdempotencyKeysTable() string {
 			}`
 }
 
-
 // GetTimeBucket returns the date bucket for time-bucketed partitioning
 func GetTimeBucket(t time.Time) string {
 	return t.Format("2006-01-02")
@@ -157,7 +156,7 @@ func GetTimeBucket(t time.Time) string {
 
 // GetHourBucket return the hour bucket for the hourly partitioning
 func GetHourBucket(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(),0,0,0, t.Location())
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
 }
 
 // DropTables drop all tables  (for testing purpose)
@@ -170,7 +169,7 @@ func (sm *SchemaManager) DropTables() error {
 		"idempotency_keys",
 	}
 
-	for _,table := range in tables {
+	for _, table := range tables {
 		query := fmt.Sprintf("DROP TABLES IF EXISTS %s", table)
 		if err := sm.session.Query(query).Exec(); err != nil {
 			return fmt.Errorf("failed to drop table %s : %w", table, err)
