@@ -28,7 +28,7 @@ const (
 
 // Payment represents a payment in the system
 type Payment struct {
-	PaymentID      string            `json:"payment_id`
+	PaymentID      string            `json:"payment_id"`
 	IdempotencyKey string            `json:"idempotency_key"`
 	Amount         decimal.Decimal   `json:"amount"`
 	Currency       string            `json:"currency"`
@@ -95,6 +95,5 @@ func (t *Transaction) ValidateDoubleEntry() error {
 	if !totalDebits.Equal(totalCredits) {
 		return ErrDoubleEntryViolation
 	}
-
 	return nil
 }

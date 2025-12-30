@@ -24,7 +24,7 @@ func NewConnectionManager(cfg config.RedisConfig) *ConnectionManager {
 
 // Connect establishes connection to Redis
 func (rm *ConnectionManager) Connect() error {
-	rm.client := redis.NewClient(&redis.Options{
+	rm.client = redis.NewClient(&redis.Options{
 		Addr:         rm.config.Addr,
 		Password:     rm.config.Password,
 		DB:           rm.config.DB,
@@ -77,7 +77,7 @@ func (rm *ConnectionManager) Healthcheck(ctx context.Context) error {
 
 // Set sets a key-value pair with expiration
 func (rm *ConnectionManager) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
-	return &rm.client.Set(ctx, key, value, expiration).Err()
+	return rm.client.Set(ctx, key, value, expiration).Err()
 }
 
 // Get gets a value by key
