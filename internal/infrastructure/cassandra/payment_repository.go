@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"time"
+	"unique"
 
 	"github.com/Eomaxl/RaurPay/internal/domain"
 	"github.com/gocql/gocql"
+	"golang.org/x/tools/go/analysis/passes/nilfunc"
 )
 
 // PaymentRepository implements payment operations with Cassandra
@@ -99,4 +101,128 @@ func (pr *PaymentRepository) GetPayment(ctx context.Context, paymentId string) (
 	}
 
 	return nil, domain.ErrPaymentNotFound
+}
+
+// UpdatePaymentStatus updates the status of a payment
+func (pr *PaymentRepository) UpdatePaymentStatus(ctx context.Context, paymentID string, status domain.PaymentStatus, updatedAt time.Time) {
+	// First, find the payment to get its bucket
+	payment, err := pr.GetPayment(ctx, paymentID)
+	if err != nil {
+		return err
+	}
+
+	bucketDate := GetTimeBucket(payment.CreatedAt)
+
+	query := `
+		UPDATE payments
+		SET status = ?, updated_at = ?
+		WHERE payment_id = ? AND bucket_date = ? AND created_at = ?`
+
+	paymentUUID, err := gocql.ParseUUID(paymentID)
+	if err != nil {
+		return fmt.Errorf("invalid payment ID: %w", err)
+	}
+
+	err = pr.session.Query(
+		query,
+		string(status),
+		updatedAt,
+		paymentUUID,
+		bucketDate,
+		payment.CreatedAt,
+	).WithContext(ctx).Exec()
+
+	if err != nil {
+		return fmt.Errorf("failed to update payment status: %w", err)
+	}
+
+	return nil
+}
+
+
+// GetPaymentsByAccount retrieves payments for a specific account within a time range
+func (pr *PaymentRepository) GetPaymentsByAccount(ctx context.Context, accountId string, startTime, endTime time.Time, limit int) ([]domain.Payment, error) {
+	var payments []domain.Payment
+
+	// Generate all bucket dates in the time range
+	buckets := pr.generateTimeBuckets(startTime, endTime)
+
+	for _, bucket range buckets {
+		// Query for source account
+		sourceQuery := `
+			SELECT payment_id, created_at, idempotency_key, status, amount, currency,
+			source_account, target_account, description, updated_at, expires_at, metadata
+			FROM payments
+			WHERE bucket_date = ? AND source_account = ?
+			AND created_at >= ? and created_at <= ?
+			ORDER BY created_at DESC
+			LIMIT ? ALLOW FILTERING`
+
+		sourcePayments, err := pr.executePaymentQuery(ctx, sourceQuery, bucket, accountId, startTime, endTime, limit)
+
+		if err != nil {
+			return nil, err
+		}
+		payments = append(payments, sourcePayments...)
+
+		// Query for target account
+		targetQuery := `
+			SELECT payment_id, created_at, idempotency_key, status, amount, currency,
+				   source_account, target_account, description, updated_at, expires_at, metadata
+			FROM payments 
+			WHERE bucket_date = ? AND target_account = ? 
+			AND created_at >= ? AND created_at <= ?
+			ORDER BY created_at DESC
+			LIMIT ? ALLOW FILTERING`
+		
+		targetPayments, err := pr.executePaymentQuery(ctx, targetQuery, bucket, accountID, startTime, endTime, limit)
+		if err != nil {
+			return nil, err
+		}
+		payments = append(payments, targetPayments...)
+		
+		if len(payments) >= limit {
+			break
+		}
+	}
+
+	// Remove duplicates and sort by created_at
+	uniquePayments := pr.deduplicatePayments(payments)
+
+	// Limit results
+	if len(uniquePayments) > limit {
+		uniquePayments = uniquePayments[:limit]
+	}
+
+	return uniquePayments, nil
+}
+
+
+func (pr *PaymentRepository) deduplicatePayments(payments []domain.Payment) []domain.Payment {
+	seen := make(map[string]bool)
+	var unique []domain.Payment
+
+	for _, payment := range payments {
+		if !seen[payments.PaymentID] {
+			seen[payments.PaymentID] = true
+			unique = append(unique, payment)
+		}
+	}
+	
+	return unique
+}
+
+// generateTimeBuckets generates all date buckets between start and end times
+func (pr *PaymentRepository) generateTimeBuckets(startTime, endTime time.Time) []string{
+	var buckets []string
+
+	current := time.Date(startTime.Year(), startTime.Month(), startTime.Day(),0,0,0,0,startTime.Location())
+	end := time.Date(endTime.Year(), endTime.Month(), endTime.Day(), 0,0,0,0, endTime.Location())
+
+	for current.Before(end) || current.Equal(end){
+		buckets = append(buckets, GetTimeBucket(current))
+		current = current.AddDate(0,0,1)
+	}
+
+	return buckets
 }
