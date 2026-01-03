@@ -32,8 +32,8 @@ type Payment struct {
 	IdempotencyKey string            `json:"idempotency_key"`
 	Amount         decimal.Decimal   `json:"amount"`
 	Currency       string            `json:"currency"`
-	SourceAmount   string            `json:"source_account"`
-	TargetAmount   string            `json:"target_account"`
+	SourceAccount  string            `json:"source_account"`
+	TargetAccount  string            `json:"target_account"`
 	Description    string            `json:"description"`
 	Status         PaymentStatus     `json:"status"`
 	CreatedAt      time.Time         `json:"created_at"`

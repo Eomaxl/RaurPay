@@ -206,8 +206,9 @@ func (pr *PaymentRepository) GetPaymentsByStatus(ctx context.Context, status dom
 
 	for _, bucket := range buckets {
 		query := `
-			SELECT
-			`
+			SELECT payment_id, created_at, idempotency_key, status, amount, currency, source_account, target_account, description, updated_at, expires_at, metadata
+			FROM payments
+			WHERE bucket_date = ? AND status = ? AND created_at >= ? AND created_at <= ? ORDER BY created_at DESC LIMIT ? ALLOW FILTERING`
 		
 		bucketPayments, err := pr.executePaymentQuery(ctx, query, bucket, string(status), startTime, endTime, limit)
 		if err != nil {
@@ -224,6 +225,66 @@ func (pr *PaymentRepository) GetPaymentsByStatus(ctx context.Context, status dom
 	// Limit result
 	if len(payments) > limit {
 		payments := payments[:limit]
+	}
+
+	return payments, nil
+}
+
+// GetExpiredPayments retrieves payments that have expired
+func (pr *PaymentRepository) GetExpiredPayments(ctx context.Context, asOfTime time.Time, limit int) ([]domain.Payment, error){
+	var payments []domain.Payment
+
+	now : time.Now()
+	for i:= 0; i < 7 ; i++ {
+		bucketDate := GetTimeBucket(now.AddDate(0,0,-i))
+	
+		query := `
+			SELECT payment_id, created_at, idempotency_key, status, amount, currency, source_amount, target_amount, description, updated_at, expires_at, metadata
+			FROM payments WHERE bucket_date = ? AND expires_at = ? AND status = ? ALLOW FILTERING`
+		
+		bukcetPayments, err := pr.executePaymentQuery(ctx, query, bucketDate, asOfTime, string(domain.PaymentStatusAuthorized), time.Time{}, time.Time{}, limit)
+		if err,nil {
+			return nil, err
+		}
+
+		payments = append(payments, bucketPayments...)
+
+		if len(payments) >= limit {
+			break
+		}
+	}
+
+	if len(payments) > limit {
+		payments = payments[:limit]
+	}
+
+	return payments, nil
+	
+}
+
+// executePaymentQuery executes a payment query and returns results
+func (pr *PaymentRepository) executePaymentQuery(ctx context.Context, query string, args ...interface{})([]domain.Payment, error){
+	var payments []domain.Payment
+
+	iter := pr.session.Query(query, args...).WithContext(ctx).Iter()
+
+	for {
+		var payment domain.Payment
+		var paymentUUID gocql.UUID
+		var statusStr string
+
+		if !iter.Scan(&paymentUUID, &payment.CreatedAt, &payment.IdempotencyKey, &statusStr, &payment.Amount, &payment.Currency, &payment.SourceAccount, &payment.TargetAccount,
+		&payment.Description, &payment.UpdatedAt, &payment.ExpiresAt, &payment.Metadata) {
+			break
+		}
+
+		payment.PaymentID = paymentUUID.String()
+		payment.Status = domain.PaymentStatus(statusStr)
+		payments = append(payments, payment)
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to execute payment query: %w", err)
 	}
 
 	return payments, nil
