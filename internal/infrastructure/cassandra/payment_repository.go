@@ -197,6 +197,37 @@ func (pr *PaymentRepository) GetPaymentsByAccount(ctx context.Context, accountId
 	return uniquePayments, nil
 }
 
+// GetPaymentsByStatus retrieves payments by status within a time range
+func (pr *PaymentRepository) GetPaymentsByStatus(ctx context.Context, status domain.PaymentStatus, startTime, endTime time.Time, limit int) ([]domain.Payment, error) {
+	var payments []domain.Payment
+
+	// Generate all bucket dates in the time range
+	buckets := pr.generateTimeBuckets(startTime, endTime)
+
+	for _, bucket := range buckets {
+		query := `
+			SELECT
+			`
+		
+		bucketPayments, err := pr.executePaymentQuery(ctx, query, bucket, string(status), startTime, endTime, limit)
+		if err != nil {
+			return nil,err
+		}
+
+		payments = append(payments, bucketPayments...)
+
+		if len(payments) > limit {
+			break
+		}
+	}
+
+	// Limit result
+	if len(payments) > limit {
+		payments := payments[:limit]
+	}
+
+	return payments, nil
+}
 
 func (pr *PaymentRepository) deduplicatePayments(payments []domain.Payment) []domain.Payment {
 	seen := make(map[string]bool)
