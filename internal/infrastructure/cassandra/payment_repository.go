@@ -3,59 +3,145 @@ package cassandra
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Eomaxl/RaurPay/internal/domain"
 	"github.com/gocql/gocql"
+	"github.com/patrickmn/go-cache"
 )
 
 // PaymentRepository implements payment operations with Cassandra
 type PaymentRepository struct {
-	session *gocql.Session
+	session  *gocql.Session
+	prepared *PreparedPaymentStatements
+	cache    *cache.Cache
+	metrics  *RepositoryMetrics
+	mu       *sync.RWMutex
+}
+
+type PreparedPaymentStatements struct {
+	insertPayment       *gocql.Query
+	getPayment          *gocql.Query
+	updatePaymentStatus *gocql.Query
+	getByIdempotencyKey *gocql.Query
+	getBySourceAccount  *gocql.Query
+	getByTargetAccount  *gocql.Query
+	getByStatus         *gocql.Query
+	insertPaymentEvent  *gocql.Query
+}
+
+type RepositoryMetrics struct {
+	TotalQueries   int64
+	CacheHits      int64
+	CacheMisses    int64
+	FailedQueries  int64
+	AverageLatency time.Duration
+	mu             sync.RWMutex
 }
 
 // NewPaymentRepository creates a new payment repository
-func NewPaymentRepository(session *gocql.Session) *PaymentRepository {
-	return &PaymentRepository{
-		session: session,
+func NewPaymentRepository(session *gocql.Session) (*PaymentRepository, error) {
+	repo := &PaymentRepository{
+		session:  session,
+		prepared: &PreparedPaymentStatements{},
+		cache:    cache.New(5*time.Minute, 10*time.Minute),
+		metrics:  &RepositoryMetrics{},
 	}
+
+	// Initialize prepared statements
+	if err := repo.initPreparedStatements(); err != nil {
+		return nil, fmt.Errorf("failed to initialize prepared statements: %w", err)
+	}
+
+	return repo, nil
+}
+
+func (pr *PaymentRepository) initPreparedStatements() error {
+	var err error
+
+	// Insert payment
+	pr.prepared.insertPayment = pr.session.Query(`
+	INSERT INTO payments(payment_id, bucket_date, created_at, idempotency_key, status, amount, currency, source_account, target_account, desceiption, updated_at, expires_at, metadata)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	`)
+
+	// Get payment by ID ( will be used at different bucket_dates)
+	pr.prepared.getPayment = pr.session.Query(`
+	SELECT payment_id, created_at, idempotency_key, status, amount, currency, source_account, target_account, description, updated_at, expires_at, metadata
+	FROM payments
+	WHERE payment_id = ? AND bucket_date = ?
+	`)
+
+	// Update payment status
+	pr.prepared.updatePaymentStatus = pr.session.Query(`
+	UPDATE payment
+	SET status = ? , updated_at = ?
+	WHERE payment_id = ? AND bucket_date = ? AND created_at = ?
+	`)
+
+	// Get idempotency key (using materialized view)
+	pr.prepared.getByIdempotencyKey = pr.session.Query(`
+	SELECT payment_id, bucket_date, created_at, status, amount, currency, source_account, target_account
+	FROM payments_by_idempotency_key
+	WHERE idempotency_key = ?
+	LIMIT 1
+	`)
+
+	// Insert payment event
+	pr.prepared.insertPaymentEvent = pr.session.Query(`
+		INSERT INTO payment_events (payment_id, event_id, event_type, old_status, new_status, created_at, metadata) VALUES (?,?,?,?,?,?,?)
+	`)
+
+	if err != nil {
+		return fmt.Errorf("failed to prepare statements : %w", err)
+	}
+
+	return nil
 }
 
 // CreatePayment creates a new payment record
 func (pr *PaymentRepository) CreatePayment(ctx context.Context, payment *domain.Payment) error {
-	bucketDate := GetTimeBucket(payment.CreatedAt)
+	start := time.Now()
+	defer pr.recordMetrics(start, nil)
 
-	query := `
-		INSERT INTO payments (
-			payment_id, bucket_date, created_at, idempotency_key, status,
-			amount, currency, source_amount, target_account, description,
-			updated_at, expires_at, metadata
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+	bucketDate := GetTimeBucket(payment.CreatedAt)
 
 	paymentUUID, err := gocql.ParseUUID(payment.PaymentID)
 	if err != nil {
-		return fmt.Errorf("invalid payment ID : %w", err)
+		pr.recordMetrics(start, err)
+		return fmt.Errorf("invalid payment ID: %w", err)
 	}
 
-	err = pr.session.Query(query,
-		paymentUUID,
-		bucketDate,
-		payment.CreatedAt,
-		payment.IdempotencyKey,
-		string(payment.Status),
-		payment.Amount,
-		payment.Currency,
-		payment.SourceAccount,
-		payment.TargetAccount,
-		payment.Description,
-		payment.UpdatedAt,
-		payment.ExpiresAt,
-		payment.Metadata,
-	).WithContext(ctx).Exec()
+	err = pr.executeWithRetry(ctx, func() error {
+		return pr.prepared.insertPayment.Bind(
+			paymentUUID,
+			bucketDate,
+			payment.CreatedAt,
+			payment.IdempotencyKey,
+			string(payment.Status),
+			payment.Amount,
+			payment.Currency,
+			payment.SourceAccount,
+			payment.TargetAccount,
+			payment.Description,
+			payment.UpdatedAt,
+			payment.ExpiresAt,
+			payment.Metadata,
+		).WithContext(ctx).Exec()
+	})
 
 	if err != nil {
-		return fmt.Errorf("failed to create payment: %w", err)
+		pr.recordMetrics(start, err)
+		return fmt.Errorf("failed to create payment : %w", err)
 	}
+
+	// Store in cache
+	cacheKey := fmt.Sprintf("payment:%s", payment.PaymentID)
+	pr.cache.Set(cacheKey, payment, cache.DefaultExpiration)
+
+	// Record payment creation event
+	_ = pr.recordPaymentEvent(ctx, payment.PaymentID, "CREATED", "", string(payment.Status))
 
 	return nil
 }
@@ -314,4 +400,138 @@ func (pr *PaymentRepository) generateTimeBuckets(startTime, endTime time.Time) [
 	}
 
 	return buckets
+}
+
+func (pr *PaymentRepository) recordMetrics(start time.Time, err error) {
+	pr.metrics.mu.Lock()
+	defer pr.metrics.mu.Unlock()
+
+	pr.metrics.TotalQueries++
+
+	if err != nil {
+		pr.metrics.FailedQueries++
+	}
+
+	duration := time.Since(start)
+	if pr.metrics.TotalQueries == 1 {
+		pr.metrics.AverageLatency = duration
+	} else {
+		pr.metrics.AverageLatency = (pr.metrics.AverageLatency + duration) / 2
+	}
+}
+
+func (pr *PaymentRepository) recordPaymentEvent(ctx context.Context, paymentID, eventType, oldStatus, newStatus string) error {
+	paymentUUID, err := gocql.ParseUUID(paymentID)
+	if err != nil {
+		return err
+	}
+
+	eventID := gocql.TimeUUID()
+	now := time.Now()
+
+	return pr.prepared.insertPaymentEvent.Bind(
+		paymentUUID,
+		eventID,
+		eventType,
+		oldStatus,
+		newStatus,
+		now,
+		map[string]string{},
+	).WithContext(ctx).Exec()
+}
+
+func (pr *PaymentRepository) executeWithRetry(ctx context.Context, operation func() error) error {
+	maxRetries := 3
+	baseDelay := 100 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err := operation()
+		if err != nil {
+			return nil
+		}
+
+		// Check if error is retryable
+		if !pr.isRetryableError(err) {
+			return err
+		}
+
+		// Last attempt - return error
+		if attempt == maxRetries-1 {
+			return fmt.Errorf("failed after %d retries : %w", maxRetries, err)
+		}
+
+		// Expotential backoff
+		delay := baseDelay * time.Duration(1<<uint(attempt))
+		select {
+		case <-time.After(delay):
+			continue
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("max retries exceeded")
+}
+
+// isRetryableError determines if an error should trigger a retry
+func (pr *PaymentRepository) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	retryableErrors := []string{
+		"connection",
+		"timeout",
+		"overloaded",
+		"unavailable",
+		"read timeout",
+		"write timeout",
+	}
+
+	for _, retryable := range retryableErrors {
+		if contains(errStr, retryable) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetMetrics returns repository metrics
+func (pr *PaymentRepository) GetMetrics() RepositoryMetrics {
+	pr.metrics.mu.RLock()
+	defer pr.metrics.mu.Unlock()
+
+	return RepositoryMetrics{
+		TotalQueries:   pr.metrics.TotalQueries,
+		CacheHits:      pr.metrics.CacheHits,
+		CacheMisses:    pr.metrics.CacheMisses,
+		FailedQueries:  pr.metrics.FailedQueries,
+		AverageLatency: pr.metrics.AverageLatency,
+	}
+}
+
+// ClearCache clears the repository cache
+func (pr *PaymentRepository) ClearCache() {
+	pr.cache.Flush()
+}
+
+// GetCacheStatus returns cache statistics
+func (pr *PaymentRepository) GetCacheStatus() map[string]interface{} {
+	pr.metrics.mu.RLock()
+	defer pr.metrics.mu.Unlock()
+
+	totalRequest := pr.metrics.CacheHits + pr.metrics.CacheMisses
+	hitRate := float64(0)
+	if totalRequest > 0 {
+		hitRate = float64(pr.metrics.CacheHits) / float64(totalRequest) * 100
+	}
+
+	return map[string]interface{}{
+		"cache_hits":       pr.metrics.CacheHits,
+		"cache_misses":     pr.metrics.CacheMisses,
+		"hit_rate_percent": hitRate,
+		"cache_item_count": pr.cache.ItemCount(),
+	}
 }
